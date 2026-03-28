@@ -61,7 +61,7 @@ export default function CampaignPage({ params }: PageProps) {
   }
 
   return (
-    <main className="w-full min-h-screen overflow-hidden">
+    <main className="w-full min-h-screen relative">
       {!started ? (
         <ChallengeIntro config={config} onStart={() => setStarted(true)} />
       ) : (

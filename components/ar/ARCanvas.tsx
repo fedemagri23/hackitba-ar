@@ -18,11 +18,17 @@ export default function ARCanvas({ config }: ARCanvasProps) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
+  const cameraRef = useRef<THREE.PerspectiveCamera | null>(null);
   
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [facingMode, setFacingMode] = useState<VideoFacingModeEnum>('user');
   const [canFlip, setCanFlip] = useState(false);
+  
+  // Interaction State
+  const [zoom, setZoom] = useState(1);
+  const startYRef = useRef<number>(0);
+  const startZoomRef = useRef<number>(1);
 
   // Recording State
   const [recordingState, setRecordingState] = useState<RecordingState>('idle');
@@ -48,6 +54,14 @@ export default function ARCanvas({ config }: ARCanvasProps) {
     updateCameraCount();
   }, []);
 
+  // Update camera zoom when zoom state changes
+  useEffect(() => {
+    if (cameraRef.current) {
+      cameraRef.current.zoom = zoom;
+      cameraRef.current.updateProjectionMatrix();
+    }
+  }, [zoom]);
+
   useEffect(() => {
     let animId: number;
     let renderer: THREE.WebGLRenderer;
@@ -58,7 +72,6 @@ export default function ARCanvas({ config }: ARCanvasProps) {
     let isActive = true;
     let currentStream: MediaStream | null = null;
     
-    // Background Video Texture entities
     let bgMesh: THREE.Mesh;
     let videoTexture: THREE.VideoTexture;
 
@@ -98,27 +111,27 @@ export default function ARCanvas({ config }: ARCanvasProps) {
         const { videoWidth, videoHeight } = videoRef.current;
         const videoAspect = videoWidth / videoHeight;
 
-        // --- Three.js Setup ---
         scene = new THREE.Scene();
         camera = new THREE.PerspectiveCamera(FOV, 1, 0.1, 1000);
         camera.position.z = DISTANCE;
+        camera.zoom = zoom;
+        camera.updateProjectionMatrix();
+        cameraRef.current = camera;
 
         renderer = new THREE.WebGLRenderer({
           canvas: canvasRef.current!,
           alpha: true,
           antialias: true,
-          preserveDrawingBuffer: true // Required for canvas capture
+          preserveDrawingBuffer: true
         });
         renderer.setPixelRatio(window.devicePixelRatio);
 
-        // --- Background Video Setup ---
         videoTexture = new THREE.VideoTexture(videoRef.current);
         videoTexture.colorSpace = THREE.SRGBColorSpace;
         
         const bgGeo = new THREE.PlaneGeometry(2, 2);
         const bgMat = new THREE.MeshBasicMaterial({ map: videoTexture });
         bgMesh = new THREE.Mesh(bgGeo, bgMat);
-        // Place background at z=0 (landmarks plane)
         bgMesh.position.z = 0; 
         scene.add(bgMesh);
 
@@ -131,26 +144,17 @@ export default function ARCanvas({ config }: ARCanvasProps) {
           camera.aspect = containerAspect;
           camera.updateProjectionMatrix();
 
-          // Calculate "Cover" scaling for background plane
-          // The background plane is at DISTANCE units away from the camera's eye at z=0
-          // At z=0, the height of the view is 2.0 units
-          // The width of the view is 2.0 * camera.aspect
-          
           let planeScaleW = 2 * camera.aspect;
           let planeScaleH = 2;
 
-          // Align background aspect to video aspect while covering the viewport
           if (containerAspect > videoAspect) {
-            // Container is wider than video aspect: scale by width
             planeScaleH = planeScaleW / videoAspect;
           } else {
-            // Container is narrower than video aspect: scale by height
             planeScaleW = planeScaleH * videoAspect;
           }
 
           bgMesh.scale.set(planeScaleW / 2, planeScaleH / 2, 1);
           
-          // Mirroring if user camera
           if (facingMode === 'user') {
             bgMesh.scale.x *= -1;
           }
@@ -159,7 +163,6 @@ export default function ARCanvas({ config }: ARCanvasProps) {
         window.addEventListener('resize', handleResize);
         handleResize();
 
-        // --- Mask Setup ---
         if (config.trackingMode === 'face') mask = new FaceMask();
         else if (config.trackingMode === 'pose') mask = new PoseMask();
         else mask = new HandMask();
@@ -167,11 +170,9 @@ export default function ARCanvas({ config }: ARCanvasProps) {
         scene.add(mask.group);
         if (config.brandObjects) config.brandObjects(mask.group);
 
-        // --- MediaPipe Setup ---
         landmarker = await createLandmarker(config.trackingMode);
         setIsLoading(false);
 
-        // --- Animation Loop ---
         const isMirrored = facingMode === 'user';
         const render = () => {
           if (!isActive) return;
@@ -202,13 +203,25 @@ export default function ARCanvas({ config }: ARCanvasProps) {
       cancelAnimationFrame(animId);
       if (renderer) renderer.dispose();
       if (currentStream) currentStream.getTracks().forEach(t => t.stop());
+      cameraRef.current = null;
     };
   }, [config, facingMode, recordingState]);
 
-  // --- Recording Logic ---
-  const startRecording = useCallback(() => {
+  // --- Unified Interaction Logic ---
+
+  const stopRecording = useCallback(() => {
+    if (recorderRef.current && recorderRef.current.state === 'recording') {
+      recorderRef.current.stop();
+    }
+    if (recordTimeoutRef.current) clearTimeout(recordTimeoutRef.current);
+    if (progressIntervalRef.current) clearInterval(progressIntervalRef.current);
+  }, []);
+
+  const startRecording = useCallback((initialY: number) => {
     if (!canvasRef.current || recordingState !== 'idle') return;
 
+    startYRef.current = initialY;
+    startZoomRef.current = zoom;
     setRecordingState('recording');
     setRecordProgress(0);
     chunksRef.current = [];
@@ -233,7 +246,6 @@ export default function ARCanvas({ config }: ARCanvasProps) {
 
       recorder.start();
 
-      // progress timer
       const duration = 15000;
       const step = 100;
       let elapsed = 0;
@@ -251,32 +263,54 @@ export default function ARCanvas({ config }: ARCanvasProps) {
       console.error('Recorder initialization failed', e);
       setRecordingState('idle');
     }
-  }, [recordingState]);
+  }, [recordingState, zoom, stopRecording]);
 
-  const stopRecording = useCallback(() => {
-    if (recorderRef.current && recorderRef.current.state === 'recording') {
-      recorderRef.current.stop();
+  const handlePointerDown = (e: React.PointerEvent) => {
+    if (recordingState === 'idle') {
+      startRecording(e.clientY);
     }
-    if (recordTimeoutRef.current) clearTimeout(recordTimeoutRef.current);
-    if (progressIntervalRef.current) clearInterval(progressIntervalRef.current);
-  }, []);
+  };
+
+  useEffect(() => {
+    if (recordingState !== 'recording') return;
+
+    const handlePointerMove = (e: PointerEvent) => {
+      const deltaY = startYRef.current - e.clientY;
+      // Sliding up 300 pixels = 4.0 additional zoom
+      const zoomFactor = Math.max(0, deltaY / 300) * 4;
+      const newZoom = Math.min(5, Math.max(1, startZoomRef.current + zoomFactor));
+      setZoom(newZoom);
+    };
+
+    const handlePointerUp = () => {
+      stopRecording();
+    };
+
+    window.addEventListener('pointermove', handlePointerMove);
+    window.addEventListener('pointerup', handlePointerUp);
+    return () => {
+      window.removeEventListener('pointermove', handlePointerMove);
+      window.removeEventListener('pointerup', handlePointerUp);
+    };
+  }, [recordingState, stopRecording]);
 
   const discardRecording = () => {
     if (recordedUrl) URL.revokeObjectURL(recordedUrl);
     setRecordedUrl(null);
     setRecordingState('idle');
     setRecordProgress(0);
+    setZoom(1);
   };
 
   const isMirrored = facingMode === 'user';
 
   return (
-    <div ref={containerRef} className="relative w-full h-screen bg-black overflow-hidden flex items-center justify-center font-sans tracking-tight">
+    <div ref={containerRef} className="relative w-full h-screen bg-black overflow-hidden flex items-center justify-center font-sans tracking-tight select-none touch-none">
       {/* Background Scanning UI */}
       {isLoading && recordingState !== 'reviewing' && !error && (
         <div className="absolute inset-0 z-40 flex flex-col items-center justify-center bg-black gap-6">
           <div className="w-16 h-16 border-4 border-white border-t-transparent rounded-full animate-spin" />
-          <div className="text-sm font-black uppercase tracking-[0.4em] animate-pulse">Iniciando IA...</div>
+          <div className="text-sm font-black uppercase tracking-[0.4em] animate-pulse">Iniciando IA... {facingMode}</div>
         </div>
       )}
 
@@ -293,13 +327,11 @@ export default function ARCanvas({ config }: ARCanvasProps) {
         </div>
       ) : (
         <>
-          {/* Main Capture Element */}
           <canvas
             ref={canvasRef}
             className={`w-full h-full object-cover transition-opacity duration-700 ${recordingState === 'reviewing' ? 'opacity-0' : 'opacity-100'}`}
           />
           
-          {/* Invisible Source */}
           <video
             ref={videoRef}
             className="hidden"
@@ -307,7 +339,6 @@ export default function ARCanvas({ config }: ARCanvasProps) {
             muted
           />
           
-          {/* AR HUD - Only visible during active AR */}
           {recordingState !== 'reviewing' && (
             <div className={`absolute inset-0 pointer-events-none z-10 border-[10px] md:border-[30px] border-black/20 transition-opacity ${recordingState === 'recording' ? 'opacity-40' : 'opacity-100'}`}>
               <div className="absolute top-8 left-8 flex flex-col items-start gap-1">
@@ -319,7 +350,18 @@ export default function ARCanvas({ config }: ARCanvasProps) {
             </div>
           )}
 
-          {/* AR Controls Bar */}
+          {/* HUD Status during recording */}
+          {recordingState === 'recording' && (
+            <div className="absolute top-12 left-0 right-0 flex flex-col items-center z-50 pointer-events-none gap-2">
+              <span className="bg-red-600 px-4 py-1.5 text-xs font-black uppercase tracking-[0.3em] text-white animate-pulse">
+                Recording {Math.floor(recordProgress * 0.15)}s
+              </span>
+              <span className="text-white text-[10px] font-black uppercase tracking-widest opacity-60">
+                Desliza hacia arriba para Zoom ({zoom.toFixed(1)}x)
+              </span>
+            </div>
+          )}
+
           {recordingState !== 'reviewing' && (
             <div className="absolute bottom-12 left-0 right-0 z-40 flex items-center justify-center gap-8 px-8 pointer-events-none">
               <div className="flex-1 flex justify-end">
@@ -335,21 +377,23 @@ export default function ARCanvas({ config }: ARCanvasProps) {
                 )}
               </div>
 
-              {/* Record Button */}
-              <button
-                onClick={recordingState === 'idle' ? startRecording : stopRecording}
-                className="pointer-events-auto group relative flex items-center justify-center"
+              {/* RECORD BUTTON - Unified Touch Interface */}
+              <div
+                onPointerDown={handlePointerDown}
+                className="pointer-events-auto group relative flex items-center justify-center cursor-pointer"
               >
-                <div className="w-20 h-20 rounded-full border-4 border-white flex items-center justify-center transition-all group-hover:scale-105 group-active:scale-95">
+                <div className={`
+                  w-20 h-20 rounded-full border-4 border-white flex items-center justify-center transition-all duration-300
+                  ${recordingState === 'recording' ? 'scale-125 border-red-600 opacity-100' : 'group-hover:scale-105'}
+                `}>
                   <div className={`
                     rounded-full transition-all duration-300
-                    ${recordingState === 'recording' ? 'w-8 h-8 bg-red-600 rounded-sm' : 'w-16 h-16 bg-red-600'}
+                    ${recordingState === 'recording' ? 'w-10 h-10 bg-red-600 rounded-lg' : 'w-16 h-16 bg-red-600'}
                   `} />
                 </div>
                 
-                {/* SVG Ring Progress */}
                 {recordingState === 'recording' && (
-                  <svg className="absolute w-24 h-24 -rotate-90">
+                  <svg className="absolute w-24 h-24 -rotate-90 scale-125">
                     <circle
                       cx="48" cy="48" r="44"
                       stroke="white" strokeWidth="4"
@@ -360,7 +404,7 @@ export default function ARCanvas({ config }: ARCanvasProps) {
                     />
                   </svg>
                 )}
-              </button>
+              </div>
 
               <div className="flex-1 flex flex-col items-start gap-1">
                 <span className="text-[9px] uppercase font-bold tracking-[0.2em] opacity-40 text-white">Tracking</span>
@@ -369,7 +413,6 @@ export default function ARCanvas({ config }: ARCanvasProps) {
             </div>
           )}
 
-          {/* Review Overlay */}
           {recordingState === 'reviewing' && recordedUrl && (
             <div className="absolute inset-0 z-50 flex flex-col items-center justify-center bg-black animate-in fade-in duration-500">
               <video
@@ -378,12 +421,10 @@ export default function ARCanvas({ config }: ARCanvasProps) {
                 className={`w-full h-full object-cover ${isMirrored ? 'scale-x-[-1]' : ''}`}
               />
               
-              {/* Review HUD */}
               <div className="absolute top-12 left-12 flex flex-col items-start gap-1">
                 <span className="bg-red-600 text-white text-[10px] font-black px-2 py-0.5 uppercase tracking-widest animate-pulse">REPLAY</span>
               </div>
 
-              {/* Review Actions */}
               <div className="absolute bottom-12 left-0 right-0 flex items-center justify-center gap-6 px-12">
                 <button
                   onClick={discardRecording}
@@ -400,15 +441,6 @@ export default function ARCanvas({ config }: ARCanvasProps) {
                   </svg>
                 </button>
               </div>
-            </div>
-          )}
-
-          {/* Recording Timer Label */}
-          {recordingState === 'recording' && (
-            <div className="absolute top-12 left-0 right-0 flex justify-center z-50">
-              <span className="bg-red-600 px-4 py-1.5 text-xs font-black uppercase tracking-[0.3em] text-white animate-pulse">
-                Recording {Math.floor(recordProgress * 0.15)}s
-              </span>
             </div>
           )}
         </>
