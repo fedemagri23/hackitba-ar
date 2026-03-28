@@ -15,7 +15,7 @@ export function landmarkToThree(
   lm: NormalizedLandmark,
   videoAspect: number,
   depthScale = 2,
-  mirror = false
+  mirror = true
 ): THREE.Vector3 {
   // 1. Handle mirroring: mirror ? 1-x : x
   const nx = mirror ? 1 - lm.x : lm.x;
